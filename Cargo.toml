@@ -1,0 +1,19 @@
+[package]
+name = "rocket-auth"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+#default = ["diesel", "serde"]
+google = []
+
+[dependencies]
+log = "*"
+rocket = { version = "0.5.0-rc.1", features = ["secrets"], defualt-features = false }
+serde = { version = "*", features = ["derive"], defualt-features = false}#, optional = true }
+diesel = { version = "*", features = [], defualt-features = false}#, optional = true }
+rand = "*"
+sha2 = "0.10.2"
+flurry = "0.4.0"
+chrono = "*"
