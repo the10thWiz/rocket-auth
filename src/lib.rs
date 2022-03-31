@@ -3,8 +3,8 @@ use std::{
     fmt::{Debug, Display},
     hash::Hash,
     marker::PhantomData,
-    str::FromStr,
-    sync::Arc,
+    str::{FromStr, Utf8Error},
+    sync::Arc, future::Future,
 };
 
 use flurry::Guard;
@@ -14,7 +14,8 @@ use rocket::{
     form::{self, FromFormField, ValueField},
     http::{Cookie, CookieJar},
     request::{FromRequest, Outcome},
-    Orbit, Request, Rocket, Sentinel,
+    tokio::sync::OnceCell,
+    Orbit, Request, Rocket, Sentinel, futures::future::pending,
 };
 
 use chrono::{DateTime, Utc};
@@ -27,6 +28,18 @@ use ::serde::{Deserialize, Serialize};
 //mod serde;
 //#[cfg(feature = "diesel")]
 mod diesel;
+
+mod templates;
+
+pub use templates::GoogleButton;
+
+#[cfg(feature = "google")]
+mod google;
+
+#[cfg(feature = "google")]
+use google::GoogleState;
+#[cfg(feature = "google")]
+pub use google::GoogleToken;
 
 const TOKEN_COOKIE: &str = "client_token";
 
@@ -73,12 +86,9 @@ pub trait UserDb: 'static {
 
 #[derive(Debug)]
 pub struct AuthFairing<Db: UserDb + ?Sized> {
+    client_id: Arc<OnceCell<String>>,
     _db: PhantomData<fn() -> Db>,
 }
-
-/// Safety: Send and Sync aren't implemented for *const Db, but I don't actually have a *const Db
-//unsafe impl<Db: UserDb> Send for AuthFairing<Db> {}
-//unsafe impl<Db: UserDb> Sync for AuthFairing<Db> {}
 
 #[rocket::async_trait]
 impl<Db: UserDb + 'static> Fairing for AuthFairing<Db> {
@@ -93,18 +103,25 @@ impl<Db: UserDb + 'static> Fairing for AuthFairing<Db> {
         let f: AuthConfig = rocket
             .figment()
             .extract_inner("rocket_auth")
-            .unwrap_or_default();
-        let logged_in = Arc::new(flurry::HashMap::new());
-        rocket::fairing::Result::Ok(rocket.manage(AuthState::<Db> {
-            logged_in,
+            .expect("Configuration values required");
+        self.client_id
+            .set(f.google_client_id)
+            .expect("Fairing initialized twice");
+        let rocket = rocket.manage(AuthState::<Db> {
+            logged_in: Arc::new(flurry::HashMap::new()),
             authentication_timeout: chrono::Duration::hours(f.timeout as i64),
             authentication_renew: chrono::Duration::hours(f.timeout as i64) * 3 / 4,
-        }))
+        });
+        #[cfg(feature = "google")]
+        let rocket = rocket.manage(GoogleState::new(Arc::clone(&self.client_id)));
+        rocket::fairing::Result::Ok(rocket)
     }
 
     async fn on_liftoff(&self, rocket: &Rocket<Orbit>) {
         let state = rocket.state::<AuthState<Db>>().unwrap();
         let handle = Arc::clone(&state.logged_in);
+        #[cfg(feature = "google")]
+        let google_handle = rocket.state::<GoogleState>().unwrap().clone();
         let shutdown = rocket.shutdown();
         let cleanup_time = state.authentication_timeout / 2;
         let timeout = state.authentication_timeout;
@@ -112,10 +129,16 @@ impl<Db: UserDb + 'static> Fairing for AuthFairing<Db> {
             use rocket::tokio::{select, time::sleep};
             let cleanup_time = cleanup_time.to_std().unwrap_or(std::time::Duration::MAX);
             let mut shutdown = shutdown;
+            // TODO: ideally this shouldn't allocate, but it's a one-time operation
+            #[cfg(feature = "google")]
+            let mut google_update = Box::pin(google_handle.update());
+            #[cfg(not(feature = "google"))]
+            let mut google_update = pending();
             loop {
                 select! {
                     biased;
                     _ = &mut shutdown => { break },
+                    _ = &mut google_update => { continue },
                     _ = sleep(cleanup_time) => { },
                 }
                 let now = Utc::now();
@@ -140,18 +163,30 @@ impl<Db: UserDb + 'static> Fairing for AuthFairing<Db> {
 
 impl<Db: UserDb + ?Sized + 'static> AuthFairing<Db> {
     pub fn fairing() -> Self {
-        Self { _db: PhantomData }
+        Self {
+            client_id: Arc::new(OnceCell::new()),
+            _db: PhantomData,
+        }
+    }
+
+    #[cfg(feature = "google")]
+    pub fn google_button(&self) -> GoogleButton {
+        GoogleButton::new(Arc::clone(&self.client_id))
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct AuthConfig {
     timeout: u32,
+    google_client_id: String,
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
-        Self { timeout: 4 }
+        Self {
+            timeout: 4,
+            google_client_id: "".into(),
+        }
     }
 }
 
@@ -325,12 +360,14 @@ pub enum AuthUpdate<'r, Db: UserDb> {
 /// a `UserAuth` also accept any of these helper structs.
 pub enum UserAuth<'a> {
     Password(Password<'a>),
-    GoogleOAuth(GoogleOAuth<'a>),
+    #[cfg(feature = "google")]
+    GoogleOAuth(GoogleToken),
 }
 impl<'a> Debug for UserAuth<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Password(_) => write!(f, "UserAuth::Password"),
+            #[cfg(feature = "google")]
             Self::GoogleOAuth(_) => write!(f, "UserAuth::GoogleOAuth"),
         }
     }
@@ -365,32 +402,24 @@ impl<'a> FromFormField<'a> for Password<'a> {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(transparent)]
-pub struct GoogleOAuth<'a>(&'a str);
-impl<'a> From<GoogleOAuth<'a>> for UserAuth<'a> {
-    fn from(p: GoogleOAuth<'a>) -> Self {
+#[cfg(feature = "google")]
+impl<'a> From<GoogleToken> for UserAuth<'a> {
+    fn from(p: GoogleToken) -> Self {
         Self::GoogleOAuth(p)
-    }
-}
-#[rocket::async_trait]
-impl<'a> FromFormField<'a> for GoogleOAuth<'a> {
-    fn from_value(field: ValueField<'a>) -> form::Result<'a, Self> {
-        Ok(Self(field.value))
-    }
-}
-
-impl<'a> UserAuth<'a> {
-    pub fn password(password: &'a str) -> Self {
-        Self::Password(Password(password))
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AuthHash {
-    Password { salt: [u8; 32], hash: [u8; 32] },
-    GoogleOAuth { _token: String },
+    Password {
+        salt: [u8; 32],
+        hash: [u8; 32],
+    },
+    #[cfg(any(feature = "google"))]
+    OAuth {
+        id: String,
+    },
 }
 
 impl AuthHash {
@@ -404,6 +433,11 @@ impl AuthHash {
                 let tmp = sha.finalize();
                 hash.iter().zip(tmp.into_iter()).all(|(&b, h)| b == h)
             }
+            #[cfg(feature = "google")]
+            (Self::OAuth { id }, UserAuth::GoogleOAuth(token)) => id
+                .strip_prefix("G")
+                .map(|id| id == token.google_id())
+                .unwrap_or(false),
             _ => false,
         }
     }
@@ -429,7 +463,10 @@ impl AuthHash {
                     .for_each(|(b, h)| *b = h);
                 Self::Password { salt, hash }
             }
-            _ => todo!(),
+            #[cfg(feature = "google")]
+            UserAuth::GoogleOAuth(token) => Self::OAuth {
+                id: format!("G{}", token.google_id()),
+            },
         }
     }
 
@@ -442,7 +479,12 @@ impl AuthHash {
                 ret.extend_from_slice(hash);
                 ret
             }
-            _ => todo!(),
+            #[cfg(any(feature = "google"))]
+            Self::OAuth { id } => {
+                let mut ret = Vec::with_capacity(id.as_bytes().len());
+                ret.extend_from_slice(id.as_bytes());
+                ret
+            }
         }
     }
 
@@ -463,15 +505,29 @@ impl AuthHash {
                     Err(AuthHashParseError::InvalidLength)
                 }
             }
+            #[cfg(feature = "google")]
+            b'G' => {
+                let prefix = bytes.split(|&b| b == 0u8).next().unwrap_or(bytes);
+                Ok(Self::OAuth {
+                    id: std::str::from_utf8(prefix)?.to_owned(),
+                })
+            }
             _ => Err(AuthHashParseError::InvalidType),
         }
     }
 }
 
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum AuthHashParseError {
     InvalidType,
     InvalidLength,
+    Utf8Error(Utf8Error),
+}
+
+impl From<Utf8Error> for AuthHashParseError {
+    fn from(e: Utf8Error) -> Self {
+        Self::Utf8Error(e)
+    }
 }
 
 impl Display for AuthHashParseError {
