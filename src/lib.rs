@@ -4,7 +4,7 @@ use std::{
     hash::Hash,
     marker::PhantomData,
     str::{FromStr, Utf8Error},
-    sync::Arc, future::Future,
+    sync::Arc,
 };
 
 use flurry::Guard;
@@ -12,25 +12,26 @@ use rand::Rng;
 use rocket::{
     fairing::{Fairing, Info, Kind},
     form::{self, FromFormField, ValueField},
+    futures::future::pending,
     http::{Cookie, CookieJar},
     request::{FromRequest, Outcome},
     tokio::sync::OnceCell,
-    Orbit, Request, Rocket, Sentinel, futures::future::pending,
+    Orbit, Request, Rocket, Sentinel,
 };
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
-//#[cfg(feature = "serde")]
 use ::serde::{Deserialize, Serialize};
 
-//#[cfg(feature = "serde")]
-//mod serde;
-//#[cfg(feature = "diesel")]
+#[cfg(feature = "diesel")]
 mod diesel;
 
 mod templates;
+#[macro_use]
+pub mod perms;
 
+#[cfg(feature = "google")]
 pub use templates::GoogleButton;
 
 #[cfg(feature = "google")]
@@ -41,11 +42,14 @@ use google::GoogleState;
 #[cfg(feature = "google")]
 pub use google::GoogleToken;
 
+pub trait OAuthToken<'a> {
+    fn as_auth(self) -> UserAuth<'a>;
+    fn user_id(&self) -> UserId<'static>;
+}
+
 const TOKEN_COOKIE: &str = "client_token";
 
-#[derive(Debug, Hash, PartialEq, Eq)]
-//#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct UserId<'a>(pub Cow<'a, str>);
 
@@ -59,9 +63,48 @@ impl UserId<'_> {
     pub fn clone(&self) -> Self {
         Self(self.0.clone())
     }
+
     pub fn to_owned(&self) -> UserId<'static> {
         UserId(Cow::Owned(self.0.clone().into_owned()))
     }
+
+    pub fn from_string(s: String) -> UserId<'static> {
+        UserId(Cow::Owned(s))
+    }
+}
+
+pub enum UserIdentifier<'s> {
+    UserId(UserId<'s>),
+    Username(Cow<'s, str>),
+}
+
+impl UserIdentifier<'_> {
+    pub fn clone(&self) -> Self {
+        match self {
+            Self::UserId(s) => Self::UserId(s.clone()),
+            Self::Username(s) => Self::Username(s.clone()),
+        }
+    }
+
+    pub fn to_owned(&self) -> UserIdentifier<'static> {
+        match self {
+            Self::UserId(s) => UserIdentifier::UserId(s.to_owned()),
+            Self::Username(s) => UserIdentifier::Username(Cow::Owned(s.clone().into_owned())),
+        }
+    }
+
+    pub fn map<R>(&self, id: impl FnOnce(&UserId<'_>) -> R, username: impl FnOnce(&str) -> R) -> R {
+        match self {
+            Self::UserId(s) => id(s),
+            Self::Username(s) => username(s.as_ref()),
+        }
+    }
+}
+
+pub struct UserEntry<'a, Info> {
+    id: UserId<'a>,
+    hash: AuthHash,
+    info: Info,
 }
 
 #[rocket::async_trait]
@@ -70,8 +113,8 @@ pub trait UserDb: 'static {
     type DbError: 'static;
     async fn get_user(
         &self,
-        id: &UserId<'_>,
-    ) -> Result<Option<(AuthHash, Self::UserInfo)>, Self::DbError>;
+        id: &UserIdentifier<'_>,
+    ) -> Result<Option<(AuthHash, UserId<'static>, Self::UserInfo)>, Self::DbError>;
     async fn create_user(
         &self,
         id: UserId<'_>,
@@ -86,7 +129,8 @@ pub trait UserDb: 'static {
 
 #[derive(Debug)]
 pub struct AuthFairing<Db: UserDb + ?Sized> {
-    client_id: Arc<OnceCell<String>>,
+    #[cfg(feature = "google")]
+    google_client_id: Arc<OnceCell<String>>,
     _db: PhantomData<fn() -> Db>,
 }
 
@@ -104,7 +148,8 @@ impl<Db: UserDb + 'static> Fairing for AuthFairing<Db> {
             .figment()
             .extract_inner("rocket_auth")
             .expect("Configuration values required");
-        self.client_id
+        #[cfg(feature = "google")]
+        self.google_client_id
             .set(f.google_client_id)
             .expect("Fairing initialized twice");
         let rocket = rocket.manage(AuthState::<Db> {
@@ -113,7 +158,7 @@ impl<Db: UserDb + 'static> Fairing for AuthFairing<Db> {
             authentication_renew: chrono::Duration::hours(f.timeout as i64) * 3 / 4,
         });
         #[cfg(feature = "google")]
-        let rocket = rocket.manage(GoogleState::new(Arc::clone(&self.client_id)));
+        let rocket = rocket.manage(GoogleState::new(Arc::clone(&self.google_client_id)));
         rocket::fairing::Result::Ok(rocket)
     }
 
@@ -164,20 +209,22 @@ impl<Db: UserDb + 'static> Fairing for AuthFairing<Db> {
 impl<Db: UserDb + ?Sized + 'static> AuthFairing<Db> {
     pub fn fairing() -> Self {
         Self {
-            client_id: Arc::new(OnceCell::new()),
+            #[cfg(feature = "google")]
+            google_client_id: Arc::new(OnceCell::new()),
             _db: PhantomData,
         }
     }
 
     #[cfg(feature = "google")]
     pub fn google_button(&self) -> GoogleButton {
-        GoogleButton::new(Arc::clone(&self.client_id))
+        GoogleButton::new(Arc::clone(&self.google_client_id))
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct AuthConfig {
     timeout: u32,
+    #[cfg(feature = "google")]
     google_client_id: String,
 }
 
@@ -185,13 +232,14 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             timeout: 4,
+            #[cfg(feature = "google")]
             google_client_id: "".into(),
         }
     }
 }
 
 struct AuthState<Db: UserDb> {
-    logged_in: Arc<flurry::HashMap<String, (UserId<'static>, Db::UserInfo)>>,
+    logged_in: Arc<flurry::HashMap<String, (UserId<'static>, bool, Db::UserInfo)>>,
     authentication_timeout: chrono::Duration,
     authentication_renew: chrono::Duration,
 }
@@ -232,27 +280,66 @@ impl<'r, Db: UserDb> AuthCtx<'r, Db> {
     /// credentials are not valid, and `Ok(Some)` if the user was successfully logged in.
     pub async fn login(
         &'r self,
-        id: UserId<'_>,
-        auth: impl Into<UserAuth<'_>>,
+        id: &str,
+        auth: Password<'_>,
     ) -> Result<Option<User<'r, Db>>, Db::DbError> {
-        Ok(if let Some((hash, info)) = self.db.get_user(&id).await? {
-            if hash.verify(auth.into()) {
-                let cookie = Self::create_cookie(&id);
+        Ok(
+            if let Some((hash, id, info)) = self
+                .db
+                .get_user(&UserIdentifier::Username(Cow::Borrowed(id)))
+                .await?
+            {
+                if hash.verify(auth.into()) {
+                    let cookie = Self::create_cookie(&id);
+                    let guard = self.cache.logged_in.guard();
+                    self.cache.logged_in.insert(
+                        cookie.value().to_owned(),
+                        (id.to_owned(), hash.is_passwd(), info),
+                        &guard,
+                    );
+                    let user = User::from_map(self.cache, cookie.value());
+                    self.cookies.add_private(cookie);
+                    user
+                } else {
+                    None
+                }
+            } else {
+                None
+            },
+        )
+    }
+
+    /// Adds or Creates an OAuth user.
+    pub async fn login_oauth<'a, T: OAuthToken<'a>>(
+        &self,
+        auth: T,
+        info: impl FnOnce(&T) -> Db::UserInfo,
+    ) -> Result<Option<User<'r, Db>>, Db::DbError> {
+        let id = auth.user_id();
+        let cookie = Self::create_cookie(&id);
+        if let Some((hash, _, info)) = self
+            .db
+            .get_user(&UserIdentifier::UserId(id.clone()))
+            .await?
+        {
+            if hash.verify(auth.as_auth()) {
                 let guard = self.cache.logged_in.guard();
                 self.cache.logged_in.insert(
                     cookie.value().to_owned(),
-                    (id.to_owned(), info),
+                    (id.to_owned(), hash.is_passwd(), info),
                     &guard,
                 );
+                drop(guard);
                 let user = User::from_map(self.cache, cookie.value());
                 self.cookies.add_private(cookie);
-                user
+                Ok(user)
             } else {
-                None
+                Ok(None)
             }
         } else {
-            None
-        })
+            let info = info(&auth);
+            self.create_user_int(id, auth.as_auth(), info).await
+        }
     }
 
     /// Creates a new user, and logs them in.
@@ -260,21 +347,37 @@ impl<'r, Db: UserDb> AuthCtx<'r, Db> {
     /// This should never return `Ok(None)`, but it is technically possible.
     pub async fn create_user(
         &self,
+        auth: impl Into<UserAuth<'_>>,
+        info: Db::UserInfo,
+    ) -> Result<Option<User<'r, Db>>, Db::DbError> {
+        let s = {
+            // Intentially avoid holding the thread_rng across an await point since it isn't send
+            let mut rng = rand::thread_rng();
+            format!("!{:X}{:X}", rng.gen::<u64>(), rng.gen::<u64>())
+        };
+        self.create_user_int(UserId(Cow::Owned(s)), auth, info)
+            .await
+    }
+
+    async fn create_user_int(
+        &self,
         id: UserId<'_>,
         auth: impl Into<UserAuth<'_>>,
         info: Db::UserInfo,
     ) -> Result<Option<User<'r, Db>>, Db::DbError> {
         let cookie = Self::create_cookie(&id);
-        if self
-            .db
-            .create_user(id.clone(), AuthHash::hash(auth.into()), info)
-            .await?
-        {
-            if let Some((_, info)) = self.db.get_user(&id).await? {
+        let auth = AuthHash::hash(auth.into());
+        let has_passwd = auth.is_passwd();
+        if self.db.create_user(id.clone(), auth, info).await? {
+            if let Some((_, _, info)) = self
+                .db
+                .get_user(&UserIdentifier::UserId(id.clone()))
+                .await?
+            {
                 let guard = self.cache.logged_in.guard();
                 self.cache.logged_in.insert(
                     cookie.value().to_owned(),
-                    (id.to_owned(), info),
+                    (id.to_owned(), has_passwd, info),
                     &guard,
                 );
                 let user = User::from_map(self.cache, cookie.value());
@@ -285,33 +388,45 @@ impl<'r, Db: UserDb> AuthCtx<'r, Db> {
         Ok(None)
     }
 
-    //pub async fn update_userinfo(
-    //&self,
-    //user: &User<'r, Db>,
-    //updated: Db::UserInfo,
-    //) -> Result<(), Db::DbError> {
-    //let (auth, _info) = self.db.get_user(user.id.clone()).await?;
-    //self.db.update_user(user.id.clone(), auth, updated).await
-    //}
-
+    /// Change user's password.
+    ///
+    /// Returns an AuthFailure if the current password is incorrect, or the user uses an Oauth
+    /// token.
     pub async fn update_userauth(
         &self,
         user: User<'r, Db>,
         current: impl Into<UserAuth<'_>>,
         new: impl Into<UserAuth<'_>>,
     ) -> Result<AuthUpdate<'r, Db>, Db::DbError> {
-        if let Some((auth, _info)) = self.db.get_user(&user.id).await? {
-            if auth.verify(current.into()) {
-                if self
-                    .db
-                    .update_user(user.id.clone(), AuthHash::hash(new.into()))
-                    .await?
-                {
-                    return Ok(AuthUpdate::Ok(user));
+        if user.has_passwd() {
+            if let Some((auth, _id, _info)) = self
+                .db
+                .get_user(&UserIdentifier::UserId(user.id.clone()))
+                .await?
+            {
+                if auth.verify(current.into()) {
+                    if self
+                        .db
+                        .update_user(user.id.clone(), AuthHash::hash(new.into()))
+                        .await?
+                    {
+                        return Ok(AuthUpdate::Ok(user));
+                    }
                 }
             }
         }
         Ok(AuthUpdate::Failed(user))
+    }
+
+    /// TODO:
+    ///
+    /// Reset password for the user identified by username. Note that this only works for users who
+    /// have a password, so an Oauth user can't reset their password.
+    pub async fn reset_passwd(
+        &self,
+        username: &str
+    ) -> Result<AuthUpdate<'r, Db>, Db::DbError> {
+        todo!()
     }
 
     fn create_cookie(id: &UserId) -> Cookie<'static> {
@@ -319,6 +434,12 @@ impl<'r, Db: UserDb> AuthCtx<'r, Db> {
         // this shouldn't matter, since private cookies should already be secure. It also protects
         // against a user logging in twice at the same time, since the two connections will have
         // different tokens.
+        //
+        // That being said, this should also prevent a user from being able to directly modify
+        // their token to become someone else. Without the rng, it may be possible to mutate your
+        // token to match someone else's token. However, with the rng, they must also find the
+        // number of an active connection. If the user isn't logged in, they can't take advantage
+        // of this since it won't be in the cache.
         Cookie::build(
             TOKEN_COOKIE,
             format!(
@@ -363,12 +484,28 @@ pub enum UserAuth<'a> {
     #[cfg(feature = "google")]
     GoogleOAuth(GoogleToken),
 }
+
 impl<'a> Debug for UserAuth<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Password(_) => write!(f, "UserAuth::Password"),
             #[cfg(feature = "google")]
             Self::GoogleOAuth(_) => write!(f, "UserAuth::GoogleOAuth"),
+        }
+    }
+}
+
+pub enum OAuth {
+    #[cfg(feature = "google")]
+    GoogleOAuth(GoogleToken),
+}
+
+impl Debug for OAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(feature = "google")]
+            Self::GoogleOAuth(_) => write!(f, "UserAuth::GoogleOAuth"),
+            _ => unreachable!(),
         }
     }
 }
@@ -408,6 +545,12 @@ impl<'a> From<GoogleToken> for UserAuth<'a> {
         Self::GoogleOAuth(p)
     }
 }
+#[cfg(feature = "google")]
+impl From<GoogleToken> for OAuth {
+    fn from(p: GoogleToken) -> Self {
+        Self::GoogleOAuth(p)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -423,6 +566,13 @@ pub enum AuthHash {
 }
 
 impl AuthHash {
+    fn is_passwd(&self) -> bool {
+        match self {
+            Self::Password { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Verify that the provided auth matches self
     fn verify(&self, auth: UserAuth<'_>) -> bool {
         match (self, auth) {
@@ -539,6 +689,7 @@ impl Display for AuthHashParseError {
 pub struct User<'r, Db: UserDb> {
     _guard: flurry::Guard<'r>,
     id: &'r UserId<'static>,
+    has_passwd: bool,
     info: &'r Db::UserInfo,
 }
 
@@ -566,13 +717,13 @@ impl<'r, Db: UserDb> User<'r, Db> {
         self.info
     }
 
-    //pub fn logout(&self) {
-    //self.cookies.remove_private(Cookie::named(TOKEN_COOKIE));
-    //}
+    pub fn has_passwd(&self) -> bool {
+        self.has_passwd
+    }
 
     fn from_map(map: &'r AuthState<Db>, name: &str) -> Option<Self> {
         let guard = map.logged_in.guard();
-        let (id, info) = map.logged_in.get(name, unsafe {
+        let (id, has_passwd, info) = map.logged_in.get(name, unsafe {
             // Safety: The guard is retuned with the this lifetime, so we should be able to
             // safely borrow it for the same lifetime here.
             &*(&guard as *const Guard) as &'r Guard
@@ -580,6 +731,7 @@ impl<'r, Db: UserDb> User<'r, Db> {
         Some(Self {
             _guard: guard,
             id,
+            has_passwd: *has_passwd,
             info,
         })
     }
@@ -609,14 +761,17 @@ impl<'r, Db: UserDb + FromRequest<'r> + Send + Sync + 'static> FromRequest<'r> f
                     let user = try_option!(User::from_map(cache, cookie.value()));
                     if duration > cache.authentication_renew {
                         let ctx: AuthCtx<Db> = try_outcome!(AuthCtx::<Db>::from_request(r).await);
-                        let (_, info) =
-                            try_option!(try_option!(ctx.db.get_user(user.id).await.ok()));
-                        let new_cookie = AuthCtx::<Db>::create_cookie(&user.id);
+                        let (_, id, info) = try_option!(try_option!(ctx
+                            .db
+                            .get_user(&UserIdentifier::UserId(user.id.clone()))
+                            .await
+                            .ok()));
+                        let new_cookie = AuthCtx::<Db>::create_cookie(&id);
                         {
                             let guard = cache.logged_in.guard();
                             cache.logged_in.insert(
                                 new_cookie.value().to_string(),
-                                (user.id.to_owned(), info),
+                                (user.id.to_owned(), user.has_passwd, info),
                                 &guard,
                             );
                         }

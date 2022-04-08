@@ -8,10 +8,10 @@ use std::error::Error;
 
 use diesel::{
     backend::Backend,
-    deserialize::Result,
+    deserialize::{Result, FromSql},
     sql_types::Binary,
-    types::{FromSql, ToSql},
-    Expression, Queryable, query_builder::QueryFragment, AppearsOnTable,
+    //types::{FromSql, ToSql},
+    Expression, Queryable, query_builder::QueryFragment, AppearsOnTable, serialize::ToSql,
 };
 
 use crate::{AuthHash, AuthHashParseError};

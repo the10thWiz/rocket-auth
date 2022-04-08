@@ -1,6 +1,7 @@
 use std::fmt::Debug;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
+use std::borrow::Cow;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 //
@@ -17,6 +18,7 @@ use reqwest::header::HeaderMap;
 use rocket::tokio::sync::OnceCell;
 use rocket::{data::FromData, form::Form, http::Status, outcome::try_outcome, Data, FromForm};
 use serde::Deserialize;
+use crate::{OAuthToken, UserId, UserAuth};
 
 pub struct GoogleToken {
     token: Token<Header, Gc, Verified>,
@@ -28,43 +30,35 @@ impl GoogleToken {
         &self.token.claims().email
     }
 
-    /// Whether Google has verified the user's email.
-    pub fn email_verified(&self) -> bool {
-        self.token.claims().email_verified
-    }
-
     /// Unique Google id
     pub fn google_id(&self) -> &str {
         &self.token.claims().sub
     }
 
     /// User's full name
-    pub fn full_name(&self) -> &str {
+    pub fn name(&self) -> &str {
         &self.token.claims().name
     }
 
-    /// User's given name. This corresponds to a European first name, suitable for informal address
-    pub fn given_name(&self) -> &str {
+    /// User's first name,
+    pub fn informal_name(&self) -> &str {
         &self.token.claims().given_name
-    }
-
-    /// User's family name. This corresponds to a European last name. This is suitable for more
-    /// formal address, although it should be noted that `full_name` is preferable when the User's
-    /// full name is desired
-    pub fn family_name(&self) -> &str {
-        &self.token.claims().family_name
-    }
-
-    /// Unique id of this token
-    #[allow(unused)]
-    fn id(&self) -> &str {
-        &self.token.claims().jti
     }
 }
 
 impl Debug for GoogleToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.token.claims())
+    }
+}
+
+impl OAuthToken<'_> for GoogleToken {
+    fn as_auth(self) -> UserAuth<'static> {
+        self.into()
+    }
+
+    fn user_id(&self) -> UserId<'static> {
+        UserId(Cow::Owned(format!("G{}", self.google_id())))
     }
 }
 
@@ -120,15 +114,12 @@ impl GoogleState {
                         let guard = self.keys.guard();
                         self.keys.clear(&guard);
                         for (k, v) in res {
-                            println!("Grabbed key: {} = {}", k, v);
                             let value = PKeyWithDigest {
                                 digest: MessageDigest::sha256(), // TODO: check this is correct
                                 key: X509::from_pem(v.as_bytes())
                                     .expect("Malformed key from Google's server")
                                     .public_key()
                                     .expect("Malformed key from Google's server"),
-                                //key: PKey::public_key_from_pem(v.as_bytes())
-                                //.expect("Malformed key from Google's server"),
                             };
                             self.keys.insert(k, value, &guard);
                         }
@@ -219,10 +210,7 @@ impl<'r> FromData<'r> for GoogleToken {
             .await
             .map_failure(|(s, e)| (s, TokenError::FormError(e))));
         if Some(token.g_csrf_token) != r.cookies().get("g_csrf_token").map(|c| c.value()) {
-            rocket::outcome::Outcome::Failure((
-                Status::BadRequest,
-                TokenError::InvalidToken("Cross Site Request Forgery Token was not valid"),
-            ))
+            rocket::outcome::Outcome::Failure((Status::BadRequest, TokenError::InvalidToken("CSRF token was invalid")))
         } else {
             let state: &GoogleState = r.rocket().state().expect("AuthFairing is required");
             let guard = state.keys.guard();
@@ -230,13 +218,7 @@ impl<'r> FromData<'r> for GoogleToken {
             match token.credential.verify_with_store(&key_store) {
                 Ok(token) => {
                     let token: Token<Header, Gc, _> = token;
-                    if token
-                        .claims()
-                        .iss
-                        .strip_prefix("https://")
-                        .unwrap_or(&token.claims().iss)
-                        != "accounts.google.com"
-                    {
+                    if token.claims().iss.trim_start_matches("https://") != "accounts.google.com" {
                         return rocket::outcome::Outcome::Failure((
                             Status::BadRequest,
                             TokenError::InvalidToken("Invalid Issuer"),
@@ -248,13 +230,13 @@ impl<'r> FromData<'r> for GoogleToken {
                             TokenError::InvalidToken("Wrong client id"),
                         ));
                     }
-                    if token.claims().exp.time() > &Utc::now() {
+                    if token.claims().exp.time() < &Utc::now() {
                         return rocket::outcome::Outcome::Failure((
                             Status::BadRequest,
                             TokenError::InvalidToken("Token expired"),
                         ));
                     }
-                    if token.claims().nbf.time() < &Utc::now() {
+                    if token.claims().nbf.time() > &Utc::now() {
                         return rocket::outcome::Outcome::Failure((
                             Status::BadRequest,
                             TokenError::InvalidToken("Token not valid yet"),
