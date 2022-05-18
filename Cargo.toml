@@ -11,10 +11,11 @@ tera = ["rocket_dyn_templates", "rocket_dyn_templates/tera"]
 
 [dependencies]
 log = { version = "^0.4", features = ["std"] }
-rocket = { version = "0.5.0-rc.1", features = ["secrets"], default-features = false }
-rocket_dyn_templates = { version = "0.1.0-rc.1", default-features = false, optional = true }
+rocket = { version = "0.5.0-rc.1", features = ["secrets"], default-features = false, path = "../Rocket/core/lib/" }
+rocket_dyn_templates = { version = "0.1.0-rc.1", default-features = false, optional = true, path = "../Rocket/contrib/dyn_templates/" }
 serde = { version = "^1.0", features = ["derive"], default-features = false }
 diesel = { version = "^1.4", default-features = false, optional = true }
+sqlx = { version = "*", default-features = false, optional = true, features = ["runtime-tokio-rustls"] }
 rand = "^0.8.5"
 sha2 = "^0.10.2"
 flurry = "^0.4.0"

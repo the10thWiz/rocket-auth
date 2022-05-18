@@ -12,7 +12,6 @@ use rand::Rng;
 use rocket::{
     fairing::{Fairing, Info, Kind},
     form::{self, FromFormField, ValueField},
-    futures::future::pending,
     http::{Cookie, CookieJar},
     request::{FromRequest, Outcome},
     tokio::sync::OnceCell,
@@ -112,16 +111,16 @@ pub trait UserDb: 'static {
     type UserInfo: Sync + Send;
     type DbError: 'static;
     async fn get_user(
-        &self,
+        &mut self,
         id: &UserIdentifier<'_>,
     ) -> Result<Option<(AuthHash, UserId<'static>, Self::UserInfo)>, Self::DbError>;
     async fn create_user(
-        &self,
+        &mut self,
         id: UserId<'_>,
         auth: AuthHash,
         info: Self::UserInfo,
     ) -> Result<bool, Self::DbError>;
-    async fn update_user(&self, id: UserId<'_>, auth: AuthHash) -> Result<bool, Self::DbError>;
+    async fn update_user(&mut self, id: UserId<'_>, auth: AuthHash) -> Result<bool, Self::DbError>;
     fn auth_fairing() -> AuthFairing<Self> {
         AuthFairing::fairing()
     }
@@ -279,7 +278,7 @@ impl<'r, Db: UserDb> AuthCtx<'r, Db> {
     /// Returns `Err` if the underlying database encounters an error, `Ok(None)` if the supplied
     /// credentials are not valid, and `Ok(Some)` if the user was successfully logged in.
     pub async fn login(
-        &'r self,
+        &'r mut self,
         id: &str,
         auth: Password<'_>,
     ) -> Result<Option<User<'r, Db>>, Db::DbError> {
@@ -311,7 +310,7 @@ impl<'r, Db: UserDb> AuthCtx<'r, Db> {
 
     /// Adds or Creates an OAuth user.
     pub async fn login_oauth<'a, T: OAuthToken<'a>>(
-        &self,
+        &mut self,
         auth: T,
         info: impl FnOnce(&T) -> Db::UserInfo,
     ) -> Result<Option<User<'r, Db>>, Db::DbError> {
@@ -346,7 +345,7 @@ impl<'r, Db: UserDb> AuthCtx<'r, Db> {
     ///
     /// This should never return `Ok(None)`, but it is technically possible.
     pub async fn create_user(
-        &self,
+        &mut self,
         auth: impl Into<UserAuth<'_>>,
         info: Db::UserInfo,
     ) -> Result<Option<User<'r, Db>>, Db::DbError> {
@@ -360,7 +359,7 @@ impl<'r, Db: UserDb> AuthCtx<'r, Db> {
     }
 
     async fn create_user_int(
-        &self,
+        &mut self,
         id: UserId<'_>,
         auth: impl Into<UserAuth<'_>>,
         info: Db::UserInfo,
@@ -393,7 +392,7 @@ impl<'r, Db: UserDb> AuthCtx<'r, Db> {
     /// Returns an AuthFailure if the current password is incorrect, or the user uses an Oauth
     /// token.
     pub async fn update_userauth(
-        &self,
+        &mut self,
         user: User<'r, Db>,
         current: impl Into<UserAuth<'_>>,
         new: impl Into<UserAuth<'_>>,
@@ -530,6 +529,7 @@ impl<'a> From<Password<'a>> for UserAuth<'a> {
         Self::Password(p)
     }
 }
+
 #[rocket::async_trait]
 impl<'a> FromFormField<'a> for Password<'a> {
     fn from_value(field: ValueField<'a>) -> form::Result<'a, Self> {
@@ -563,6 +563,54 @@ pub enum AuthHash {
     OAuth {
         id: String,
     },
+}
+
+#[cfg(feature = "sqlx")]
+mod sqlx {
+    use super::{AuthHash, UserId};
+    use sqlx::{Type, Database, Encode, Decode};
+
+    impl<DB: Database> Type<DB> for AuthHash where Vec<u8>: Type<DB> {
+        fn type_info() -> DB::TypeInfo {
+            <Vec<u8> as Type<DB>>::type_info()
+        }
+        fn compatible(ty: &DB::TypeInfo) -> bool {
+            <Vec<u8> as Type<DB>>::compatible(ty)
+        }
+    }
+
+    impl<'q, DB: Database> Encode<'q, DB> for AuthHash where Vec<u8>: Encode<'q, DB> {
+        fn encode_by_ref(
+            &self,
+            buf: &mut <DB as sqlx::database::HasArguments<'q>>::ArgumentBuffer
+        ) -> sqlx::encode::IsNull where Self: Sized {
+            self.to_bytes().encode(buf)
+        }
+    }
+
+    impl<DB: Database> Type<DB> for UserId<'_> where String: Type<DB> {
+        fn type_info() -> DB::TypeInfo {
+            <String as Type<DB>>::type_info()
+        }
+        fn compatible(ty: &DB::TypeInfo) -> bool {
+            <String as Type<DB>>::compatible(ty)
+        }
+    }
+
+    impl<'q, DB: Database> Encode<'q, DB> for UserId<'_> where String: Encode<'q, DB> {
+        fn encode_by_ref(
+            &self,
+            buf: &mut <DB as sqlx::database::HasArguments<'q>>::ArgumentBuffer
+        ) -> sqlx::encode::IsNull where Self: Sized {
+            self.0.clone().into_owned().encode(buf)
+        }
+        fn encode(
+            self,
+            buf: &mut <DB as sqlx::database::HasArguments<'q>>::ArgumentBuffer
+        ) -> sqlx::encode::IsNull where Self: Sized {
+            self.0.into_owned().encode(buf)
+        }
+    }
 }
 
 impl AuthHash {
@@ -620,7 +668,7 @@ impl AuthHash {
         }
     }
 
-    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             Self::Password { salt, hash } => {
                 let mut ret = Vec::with_capacity(1 + salt.len() + hash.len());
@@ -638,7 +686,7 @@ impl AuthHash {
         }
     }
 
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, AuthHashParseError> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, AuthHashParseError> {
         match bytes[0] {
             b'!' => {
                 if bytes.len() == 65 {
@@ -760,7 +808,7 @@ impl<'r, Db: UserDb + FromRequest<'r> + Send + Sync + 'static> FromRequest<'r> f
                 if duration < cache.authentication_timeout {
                     let user = try_option!(User::from_map(cache, cookie.value()));
                     if duration > cache.authentication_renew {
-                        let ctx: AuthCtx<Db> = try_outcome!(AuthCtx::<Db>::from_request(r).await);
+                        let mut ctx: AuthCtx<Db> = try_outcome!(AuthCtx::<Db>::from_request(r).await);
                         let (_, id, info) = try_option!(try_option!(ctx
                             .db
                             .get_user(&UserIdentifier::UserId(user.id.clone()))
